@@ -27,7 +27,7 @@ from app.models.track import (
     Track,
     TrackTimelineEvent,
 )
-from app.models.user import VALID_USER_ROLES, User
+from app.models.user import RefreshToken, VALID_USER_ROLES, User
 
 __all__ = [
     "ChatMessage",
@@ -35,6 +35,7 @@ __all__ = [
     "Interaction",
     "QueueEntry",
     "QueueEvent",
+    "RefreshToken",
     "SoundclashBattle",
     "SoundclashCandidate",
     "Track",

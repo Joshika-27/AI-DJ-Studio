@@ -1,10 +1,10 @@
-"""User ORM model (PRD Section 7.2.2, REQ-051, REQ-053, REQ-070)."""
+"""User and RefreshToken ORM models (PRD Section 7.2.2, REQ-051, REQ-053, REQ-069, REQ-070, F-03)."""
 
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List
 import uuid
 
-from sqlalchemy import CheckConstraint, DateTime, String
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, JSONB_TYPE, utc_now
@@ -86,3 +86,52 @@ class User(Base):
         "QueueEvent",
         back_populates="user",
     )
+    refresh_tokens: Mapped[List["RefreshToken"]] = relationship(
+        "RefreshToken",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+
+class RefreshToken(Base):
+    """Persistent refresh token registry supporting single-use rotation, replay detection, and revocation (F-03)."""
+
+    __tablename__ = "refresh_tokens"
+
+    jti: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    token_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    issued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    revoked: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+    replaced_by_jti: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    user: Mapped["User"] = relationship("User", back_populates="refresh_tokens")

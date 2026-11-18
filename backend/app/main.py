@@ -7,6 +7,7 @@ from typing import Callable
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.v1.auth import router as auth_router
 from app.api.v1.health import router as health_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
@@ -45,6 +46,7 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
         docs_url="/docs",
         redoc_url="/redoc",
     )
+    app.state.settings = settings
 
     # 1. Configure CORS middleware
     app.add_middleware(
@@ -95,8 +97,9 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     # 3. Centralized error handlers
     register_exception_handlers(app)
 
-    # 4. Register API v1 routers (Module 1: Health)
+    # 4. Register API v1 routers (Module 1: Health, Module 3: Auth & RBAC)
     app.include_router(health_router, prefix="/api/v1")
+    app.include_router(auth_router, prefix="/api/v1")
 
     return app
 

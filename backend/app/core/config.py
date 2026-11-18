@@ -1,13 +1,48 @@
-"""Application configuration loaded strictly from environment variables (REQ-073)."""
+"""Application configuration loaded strictly from environment variables (REQ-073, F-04)."""
 
 from functools import lru_cache
 from pathlib import Path
 from typing import List
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+ALLOWED_JWT_ALGORITHMS = {"HS256", "HS384", "HS512"}
+KNOWN_PLACEHOLDER_SECRETS = {
+    "replace_with_a_strong_32_byte_secret_key",
+    "replace_with_a_strong_32_byte_refresh_secret_key",
+    "replace_with_32_byte_random_secret",
+    "changeme",
+    "secret",
+    "password",
+    "default",
+    "your_secret_key",
+}
+MIN_JWT_SECRET_LENGTH = 32
+
+
+def _validate_jwt_secret_strength(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{field_name} cannot be an empty string.")
+    lower_val = stripped.lower()
+    if (
+        lower_val in KNOWN_PLACEHOLDER_SECRETS
+        or lower_val.startswith("replace_with_")
+        or lower_val.startswith("example_")
+    ):
+        raise ValueError(
+            f"{field_name} uses a forbidden placeholder/example value."
+        )
+    if len(stripped) < MIN_JWT_SECRET_LENGTH:
+        raise ValueError(
+            f"{field_name} must be at least {MIN_JWT_SECRET_LENGTH} characters long."
+        )
+    return stripped
 
 
 class Settings(BaseSettings):
@@ -50,6 +85,48 @@ class Settings(BaseSettings):
         if normalized not in allowed:
             raise ValueError(f"LOG_LEVEL must be one of {sorted(allowed)}")
         return normalized
+
+    @field_validator("JWT_ALGORITHM")
+    @classmethod
+    def validate_jwt_algorithm(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized not in ALLOWED_JWT_ALGORITHMS:
+            raise ValueError(
+                f"JWT_ALGORITHM must be one of {sorted(ALLOWED_JWT_ALGORITHMS)}."
+            )
+        return normalized
+
+    @field_validator("JWT_SECRET_KEY")
+    @classmethod
+    def validate_access_secret(cls, value: str | None) -> str | None:
+        return _validate_jwt_secret_strength(value, "JWT_SECRET_KEY")
+
+    @field_validator("JWT_REFRESH_SECRET_KEY")
+    @classmethod
+    def validate_refresh_secret(cls, value: str | None) -> str | None:
+        return _validate_jwt_secret_strength(value, "JWT_REFRESH_SECRET_KEY")
+
+    @model_validator(mode="after")
+    def validate_security_configuration(self) -> "Settings":
+        if (
+            self.JWT_SECRET_KEY is not None
+            and self.JWT_REFRESH_SECRET_KEY is not None
+            and self.JWT_SECRET_KEY == self.JWT_REFRESH_SECRET_KEY
+        ):
+            raise ValueError(
+                "JWT_SECRET_KEY and JWT_REFRESH_SECRET_KEY must be distinct secrets."
+            )
+
+        if self.APP_ENV.strip().lower() == "production":
+            if not self.JWT_SECRET_KEY:
+                raise ValueError(
+                    "JWT_SECRET_KEY environment variable must be configured in production."
+                )
+            if not self.JWT_REFRESH_SECRET_KEY:
+                raise ValueError(
+                    "JWT_REFRESH_SECRET_KEY environment variable must be configured in production."
+                )
+        return self
 
     @property
     def cors_origins_list(self) -> List[str]:
