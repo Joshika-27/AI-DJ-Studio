@@ -12,8 +12,19 @@ from app.schemas.auth import (
     UserPreferencesSchema,
     UserProfileResponse,
 )
+from app.schemas.track import (
+    AcousticProfileSchema,
+    AdminTrackUploadRequest,
+    TimelineEventResponseSchema,
+    TimelineEventUploadSchema,
+    TrackAcousticProfileResponse,
+    TrackCatalogItemResponse,
+    TrackCatalogListResponse,
+)
 
 __all__ = [
+    "AcousticProfileSchema",
+    "AdminTrackUploadRequest",
     "LoginRequest",
     "LoginResponse",
     "LogoutRequest",
@@ -22,6 +33,11 @@ __all__ = [
     "RefreshResponse",
     "RegisterRequest",
     "RegisterResponse",
+    "TimelineEventResponseSchema",
+    "TimelineEventUploadSchema",
+    "TrackAcousticProfileResponse",
+    "TrackCatalogItemResponse",
+    "TrackCatalogListResponse",
     "UserPreferencesSchema",
     "UserProfileResponse",
 ]

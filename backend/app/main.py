@@ -6,9 +6,11 @@ from typing import Callable
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.auth import router as auth_router
 from app.api.v1.health import router as health_router
+from app.api.v1.tracks import router as tracks_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import (
@@ -17,6 +19,7 @@ from app.core.logging import (
     get_logger,
     set_log_context,
 )
+from app.seeds.seed_data import AUDIO_ASSETS_DIR
 
 _LOUNGE_PATH_REGEX = re.compile(r"/lounges/([^/]+)")
 
@@ -97,9 +100,17 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     # 3. Centralized error handlers
     register_exception_handlers(app)
 
-    # 4. Register API v1 routers (Module 1: Health, Module 3: Auth & RBAC)
+    # 4. Mount static /assets/audio/* without import-time or startup-time filesystem generation side effects
+    app.mount(
+        "/assets/audio",
+        StaticFiles(directory=str(AUDIO_ASSETS_DIR), check_dir=False),
+        name="audio_assets",
+    )
+
+    # 5. Register API v1 routers (Module 1: Health, Module 3: Auth & RBAC, Module 4: Tracks)
     app.include_router(health_router, prefix="/api/v1")
     app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(tracks_router, prefix="/api/v1")
 
     return app
 
