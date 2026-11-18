@@ -1,0 +1,38 @@
+# Environment & Secrets (NEVER COMMIT — REQ-073)
+.env
+.env.*
+!.env.example
+
+# Python Virtual Environments & Bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Testing & Coverage Artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Node / Frontend Dependencies & Build (Track A)
+node_modules/
+dist/
+build/
+.vite/
+
+# Local Databases, Logs & Temporary Artifacts
+*.db
+*.sqlite3
+*.log
+logs/
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
