@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.auth import router as auth_router
 from app.api.v1.health import router as health_router
+from app.api.v1.lounges import router as lounges_router
 from app.api.v1.tracks import router as tracks_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
@@ -29,7 +30,7 @@ def _extract_lounge_id(request: Request) -> str | None:
     if header_lounge_id:
         return header_lounge_id.strip()
     match = _LOUNGE_PATH_REGEX.search(request.url.path)
-    if match:
+    if match and match.group(1).lower() != "join":
         return match.group(1)
     return None
 
@@ -107,10 +108,11 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
         name="audio_assets",
     )
 
-    # 5. Register API v1 routers (Module 1: Health, Module 3: Auth & RBAC, Module 4: Tracks)
+    # 5. Register API v1 routers (Module 1: Health, Module 3: Auth & RBAC, Module 4: Tracks, Module 5/6: Lounges)
     app.include_router(health_router, prefix="/api/v1")
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(tracks_router, prefix="/api/v1")
+    app.include_router(lounges_router, prefix="/api/v1")
 
     return app
 
