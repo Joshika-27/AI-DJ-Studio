@@ -81,6 +81,8 @@ erDiagram
         boolean soundclash_enabled "NOT NULL, DEFAULT true"
         varchar ai_verbosity "NOT NULL: low|normal|high"
         int peak_participants "NOT NULL, DEFAULT 1"
+        boolean is_locked "NOT NULL, DEFAULT false"
+        int queue_version "NOT NULL, DEFAULT 1"
         timestamp created_at "NOT NULL"
         timestamp ended_at "Nullable"
     }
@@ -203,6 +205,7 @@ erDiagram
 | `ai_verbosity` | `VARCHAR(20)` | `NOT NULL DEFAULT 'normal'` | Required | AI DJ banter verbosity (`low`, `normal`, `high`) |
 | `peak_participants`| `INTEGER` | `NOT NULL DEFAULT 1` | Required | Peak concurrent users for session analytics |
 | `is_locked` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Required | Host moderation room lock flag (`REQ-025`) |
+| `queue_version` | `INTEGER` | `NOT NULL DEFAULT 1` | Required | Persistent queue version incremented transactionally for every queue mutation (`REQ-020`, `REQ-027`) |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Required | Creation timestamp |
 | `ended_at` | `TIMESTAMPTZ` | `NULL` | Optional | Session completion timestamp |
 
