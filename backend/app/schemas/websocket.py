@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.schemas.queue import NowPlayingTrackSchema, QueueItemSchema
+from app.schemas.queue import (
+    NowPlayingTrackSchema,
+    QueueItemSchema,
+    QueueVoteRequest,
+)
 
 
 def make_ws_envelope(
@@ -123,3 +127,9 @@ class LoungeQueueUpdatePayload(BaseModel):
     nowPlaying: Optional[NowPlayingTrackSchema] = None
     reason: Literal["vote", "add", "segue", "battle", "override"]
     version: int
+
+
+class LoungeQueueVotePayload(QueueVoteRequest):
+    """Payload for client-to-server lounge.queue.vote event (REQ-061, API_DESIGN Section 2.3)."""
+
+    model_config = ConfigDict(extra="forbid")

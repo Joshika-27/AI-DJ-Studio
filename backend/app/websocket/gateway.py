@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import uuid
 
 from fastapi import APIRouter
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -21,8 +22,12 @@ from app.models.lounge import DJLounge
 from app.models.queue import QueueEntry, QueueEvent
 from app.models.user import User
 from app.schemas.lounge import format_iso_utc
-from app.schemas.websocket import make_ws_envelope
-from app.services.lounge_service import _reconstruct_lounge_membership
+from app.schemas.queue import QueueVoteRequest
+from app.schemas.websocket import LoungeQueueVotePayload, make_ws_envelope
+from app.services.lounge_service import (
+    _reconstruct_lounge_membership,
+    vote_track_in_lounge_queue,
+)
 from app.services.room_state_manager import room_state_manager
 from app.websocket.connection_manager import connection_manager
 
@@ -271,17 +276,37 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
         )
         await connection_manager.broadcast(loungeId, presence_msg, exclude_ws=websocket)
 
-    # 8. Receive loop for ping/pong (REQ-068)
+    # 8. Receive loop for ping/pong (REQ-068) and live queue voting (REQ-061)
     try:
         while True:
             data = await websocket.receive_json()
             if not isinstance(data, dict):
+                err_msg = make_ws_envelope(
+                    event="lounge.error",
+                    lounge_id=loungeId,
+                    payload={"code": "INVALID_PAYLOAD", "message": "Expected JSON object."},
+                )
+                await connection_manager.send_personal(websocket, err_msg)
                 continue
 
             event_name = data.get("event")
             payload = data.get("payload")
+            envelope_lounge_id = data.get("loungeId")
             if not isinstance(payload, dict):
                 payload = {}
+
+            # Cross-lounge isolation check (REQ-076)
+            if envelope_lounge_id and envelope_lounge_id != loungeId:
+                err_msg = make_ws_envelope(
+                    event="lounge.error",
+                    lounge_id=loungeId,
+                    payload={
+                        "code": "FORBIDDEN",
+                        "message": f"Cross-lounge operations are forbidden: '{envelope_lounge_id}' != '{loungeId}'.",
+                    },
+                )
+                await connection_manager.send_personal(websocket, err_msg)
+                continue
 
             if event_name == "lounge.sync.ping":
                 client_sent_at = payload.get("clientSentAt")
@@ -296,6 +321,86 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
                         },
                     )
                     await connection_manager.send_personal(websocket, pong_msg)
+
+            elif event_name == "lounge.queue.vote":
+                # Validate envelope loungeId requirement (REQ-060, REQ-061)
+                if not envelope_lounge_id:
+                    err_msg = make_ws_envelope(
+                        event="lounge.error",
+                        lounge_id=loungeId,
+                        payload={
+                            "code": "INVALID_PAYLOAD",
+                            "message": "Envelope 'loungeId' is required.",
+                        },
+                    )
+                    await connection_manager.send_personal(websocket, err_msg)
+                    continue
+
+                # Validate vote payload schema (REQ-061)
+                try:
+                    vote_payload = LoungeQueueVotePayload(**payload)
+                except (ValidationError, ValueError):
+                    err_msg = make_ws_envelope(
+                        event="lounge.error",
+                        lounge_id=loungeId,
+                        payload={
+                            "code": "INVALID_PAYLOAD",
+                            "message": "Malformed vote payload: trackId must be a valid non-empty identifier without extra fields.",
+                        },
+                    )
+                    await connection_manager.send_personal(websocket, err_msg)
+                    continue
+
+                # Execute authoritative vote via existing service logic
+                session_maker = get_session_maker()
+                async with session_maker() as db:
+                    user_stmt = select(User).where(User.id == user_id)
+                    current_user = (await db.execute(user_stmt)).scalar_one_or_none()
+                    if current_user is None:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": "UNAUTHORIZED", "message": "User not found."},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    try:
+                        await vote_track_in_lounge_queue(
+                            db=db,
+                            lounge_id=loungeId,
+                            current_user=current_user,
+                            payload=QueueVoteRequest(trackId=vote_payload.trackId),
+                        )
+                    except AppException as exc:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": exc.code, "message": exc.message},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                    except Exception as exc:
+                        logger.error(
+                            f"Unexpected error processing WebSocket vote in lounge '{loungeId}': {exc}",
+                            extra={"loungeId": loungeId, "userId": user_id, "error": str(exc)},
+                        )
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": "INTERNAL_ERROR", "message": "Failed to process vote."},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+
+            else:
+                err_msg = make_ws_envelope(
+                    event="lounge.error",
+                    lounge_id=loungeId,
+                    payload={
+                        "code": "UNSUPPORTED_EVENT",
+                        "message": f"Unsupported or unrecognized WebSocket event '{event_name}'.",
+                    },
+                )
+                await connection_manager.send_personal(websocket, err_msg)
     except WebSocketDisconnect:
         logger.info(
             f"WebSocket disconnected for user '{user_id}' in lounge '{loungeId}'",
