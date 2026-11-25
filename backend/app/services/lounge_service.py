@@ -41,7 +41,14 @@ from app.schemas.lounge import (
     LoungeSummaryResponse,
     format_iso_utc,
 )
+from app.schemas.queue import (
+    QueueAddRequest,
+    QueueOverrideRequest,
+    QueueResponse,
+    QueueVoteRequest,
+)
 from app.schemas.track import _format_bpm_value
+from app.services.room_state_manager import room_state_manager
 
 logger = get_logger("services.lounge")
 
@@ -1073,3 +1080,145 @@ async def moderate_lounge(
             action=action,
             moderationState=updated_membership["moderationState"],
         )
+
+
+async def assert_lounge_participant(
+    db: AsyncSession,
+    lounge: DJLounge,
+    user: User,
+) -> Dict[str, Any]:
+    """Verify that user is an active participant in the lounge (or owner/admin) and not removed."""
+    membership = await _reconstruct_lounge_membership(db, lounge)
+    if user.id in membership["removedUserIds"]:
+        raise AppException(
+            message="You have been removed from this DJ Lounge by the Host.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="USER_REMOVED",
+        )
+    is_owner = lounge.host_user_id == user.id
+    is_admin = user.role == "admin"
+    is_active = user.id in membership["activeJoinedAt"]
+    if not (is_owner or is_admin or is_active):
+        raise AppException(
+            message="You must join this DJ Lounge before interacting with the queue.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="NOT_LOUNGE_MEMBER",
+        )
+    return membership
+
+
+async def add_track_to_lounge_queue(
+    db: AsyncSession,
+    lounge_id: str,
+    current_user: User,
+    payload: QueueAddRequest,
+) -> QueueResponse:
+    """Add a track to the Next Up queue of a DJ Lounge (REQ-020, REQ-054)."""
+    lounge = await _load_lounge_with_relations(db, lounge_id)
+    await assert_lounge_participant(db, lounge, current_user)
+
+    state = await room_state_manager.add_track(
+        db=db,
+        lounge_id=lounge_id,
+        track_id=payload.trackId,
+        user_id=current_user.id,
+    )
+    return state.to_queue_response()
+
+async def vote_track_in_lounge_queue(
+    db: AsyncSession,
+    lounge_id: str,
+    current_user: User,
+    payload: QueueVoteRequest,
+) -> QueueResponse:
+    """Upvote a track in Next Up queue (REQ-021, REQ-027)."""
+    lounge = await _load_lounge_with_relations(db, lounge_id)
+    await assert_lounge_participant(db, lounge, current_user)
+
+    state = await room_state_manager.vote_track(
+        db=db,
+        lounge_id=lounge_id,
+        track_id=payload.trackId,
+        user_id=current_user.id,
+    )
+    return state.to_queue_response()
+
+async def override_lounge_queue(
+    db: AsyncSession,
+    lounge_id: str,
+    current_user: User,
+    payload: QueueOverrideRequest,
+) -> QueueResponse:
+    """Execute manual Host/Co-DJ/Admin queue override actions (promote, remove, force_segue) (REQ-015, REQ-070)."""
+    lounge = await _load_lounge_with_relations(db, lounge_id)
+    membership = await assert_lounge_participant(db, lounge, current_user)
+
+    # Role authorization check: co_dj, host, or admin (REQ-015, REQ-070)
+    # Queue override permissions must come strictly from the user's role in this specific lounge,
+    # never falling back to global User.role for co_dj privileges.
+    lounge_role = membership["participantRoles"].get(current_user.id, "listener")
+    is_admin = current_user.role == "admin"
+    is_host = (current_user.id == lounge.host_user_id) or (lounge_role == "host")
+    is_co_dj = lounge_role == "co_dj"
+
+    if not (is_admin or is_host or is_co_dj):
+        raise AppException(
+            message="Insufficient permissions to execute queue override actions.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="FORBIDDEN",
+        )
+
+    action = payload.action
+    if action == "promote":
+        if not payload.trackId:
+            raise AppException(
+                message="trackId is required when action is 'promote'.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code="TRACK_ID_REQUIRED",
+            )
+        state = await room_state_manager.promote_track(
+            db=db,
+            lounge_id=lounge_id,
+            track_id=payload.trackId,
+            user_id=current_user.id,
+            target_position=payload.targetPosition,
+        )
+    elif action == "remove":
+        if not payload.trackId:
+            raise AppException(
+                message="trackId is required when action is 'remove'.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code="TRACK_ID_REQUIRED",
+            )
+        state = await room_state_manager.remove_track(
+            db=db,
+            lounge_id=lounge_id,
+            track_id=payload.trackId,
+            user_id=current_user.id,
+        )
+    elif action == "force_segue":
+        state = await room_state_manager.force_segue(
+            db=db,
+            lounge_id=lounge_id,
+            user_id=current_user.id,
+            target_track_id=payload.trackId,
+        )
+    else:
+        raise AppException(
+            message=f"Unsupported queue override action '{action}'.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="INVALID_ACTION",
+        )
+
+    return state.to_queue_response()
+
+async def get_lounge_queue_state(
+    db: AsyncSession,
+    lounge_id: str,
+    current_user: User,
+) -> QueueResponse:
+    """Fetch authoritative 3-zone room queue state (REQ-020)."""
+    lounge = await _load_lounge_with_relations(db, lounge_id)
+    await assert_lounge_participant(db, lounge, current_user)
+    state = await room_state_manager.get_or_hydrate_room(db, lounge_id)
+    return state.to_queue_response()

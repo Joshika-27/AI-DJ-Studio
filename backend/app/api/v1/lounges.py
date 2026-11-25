@@ -17,14 +17,24 @@ from app.schemas.lounge import (
     LoungeModerationResponse,
     LoungeStartResponse,
 )
+from app.schemas.queue import (
+    QueueAddRequest,
+    QueueOverrideRequest,
+    QueueResponse,
+    QueueVoteRequest,
+)
 from app.services.lounge_service import (
+    add_track_to_lounge_queue,
     create_lounge,
     end_lounge,
     get_lounge_detail,
+    get_lounge_queue_state,
     join_lounge_by_invite_code,
     list_lounges,
     moderate_lounge,
+    override_lounge_queue,
     start_lounge,
+    vote_track_in_lounge_queue,
 )
 
 router = APIRouter(tags=["DJ Lounges & Host Moderation"])
@@ -154,4 +164,86 @@ async def moderate_dj_lounge(
         lounge_id=id.strip(),
         current_user=current_user,
         payload=payload,
+    )
+
+
+@router.post(
+    "/lounges/{id}/queue",
+    response_model=QueueResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a track to Next Up queue (REQ-020, REQ-054)",
+)
+async def add_track_to_queue(
+    payload: QueueAddRequest,
+    id: str = Path(..., min_length=1, max_length=64),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> QueueResponse:
+    """Add a track to Next Up queue with sparse position assignment (REQ-020, REQ-054)."""
+    return await add_track_to_lounge_queue(
+        db=db,
+        lounge_id=id.strip(),
+        current_user=current_user,
+        payload=payload,
+    )
+
+
+@router.post(
+    "/lounges/{id}/queue/vote",
+    response_model=QueueResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Upvote a track in Next Up queue (REQ-021, REQ-027)",
+)
+async def vote_track_in_queue(
+    payload: QueueVoteRequest,
+    id: str = Path(..., min_length=1, max_length=64),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> QueueResponse:
+    """Upvote a track in Next Up and trigger deterministic queue re-sorting (REQ-021, REQ-027)."""
+    return await vote_track_in_lounge_queue(
+        db=db,
+        lounge_id=id.strip(),
+        current_user=current_user,
+        payload=payload,
+    )
+
+
+@router.post(
+    "/lounges/{id}/queue/override",
+    response_model=QueueResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Host/Co-DJ manual queue override (promote, remove, force_segue) (REQ-015, REQ-070)",
+)
+async def override_queue(
+    payload: QueueOverrideRequest,
+    id: str = Path(..., min_length=1, max_length=64),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> QueueResponse:
+    """Execute Host/Co-DJ/Admin queue override actions (promote, remove, force_segue) (REQ-015, REQ-070)."""
+    return await override_lounge_queue(
+        db=db,
+        lounge_id=id.strip(),
+        current_user=current_user,
+        payload=payload,
+    )
+
+
+@router.get(
+    "/lounges/{id}/queue",
+    response_model=QueueResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Fetch current 3-zone queue state (REQ-020)",
+)
+async def get_queue(
+    id: str = Path(..., min_length=1, max_length=64),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> QueueResponse:
+    """Return authoritative Next Up queue and Now Playing state for a DJ Lounge."""
+    return await get_lounge_queue_state(
+        db=db,
+        lounge_id=id.strip(),
+        current_user=current_user,
     )
