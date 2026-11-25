@@ -18,6 +18,7 @@ from app.core.logging import get_logger
 from app.core.security import decode_access_token
 from app.db.base import utc_now
 from app.db.session import get_session_maker
+from app.models.chat import ChatMessage
 from app.models.lounge import DJLounge
 from app.models.queue import QueueEntry, QueueEvent
 from app.models.user import User
@@ -25,6 +26,7 @@ from app.schemas.lounge import format_iso_utc
 from app.schemas.queue import QueueVoteRequest
 from app.schemas.websocket import (
     LoungeChatMessagePayload,
+    LoungeChatReactionPayload,
     LoungeChatTypingPayload,
     LoungeQueueVotePayload,
     make_ws_envelope,
@@ -607,6 +609,132 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
                         },
                     )
                     await connection_manager.broadcast(loungeId, typing_broadcast)
+
+            elif event_name in ("lounge.chat.reaction", "lounge.chat.react"):
+                # 1. Envelope loungeId check
+                if not envelope_lounge_id:
+                    err_msg = make_ws_envelope(
+                        event="lounge.error",
+                        lounge_id=loungeId,
+                        payload={
+                            "code": "INVALID_PAYLOAD",
+                            "message": "Envelope 'loungeId' is required.",
+                        },
+                    )
+                    await connection_manager.send_personal(websocket, err_msg)
+                    continue
+
+                # 2. Schema validation (disallow extra/client-spoofed fields)
+                try:
+                    reaction_payload = LoungeChatReactionPayload(**payload)
+                except (ValidationError, ValueError):
+                    err_msg = make_ws_envelope(
+                        event="lounge.error",
+                        lounge_id=loungeId,
+                        payload={
+                            "code": "INVALID_PAYLOAD",
+                            "message": "Malformed reaction payload: messageId and valid emoji are required without extra fields.",
+                        },
+                    )
+                    await connection_manager.send_personal(websocket, err_msg)
+                    continue
+
+                # 3. Database validation: lounge status, user, membership, moderation, target message
+                session_maker = get_session_maker()
+                async with session_maker() as db:
+                    lounge_stmt = select(DJLounge).where(DJLounge.id == loungeId)
+                    lounge = (await db.execute(lounge_stmt)).scalar_one_or_none()
+                    if lounge is None or lounge.status == "ended":
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={
+                                "code": "LOUNGE_ENDED" if lounge and lounge.status == "ended" else "LOUNGE_NOT_FOUND",
+                                "message": "Cannot send reactions for this lounge.",
+                            },
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    user_stmt = select(User).where(User.id == user_id)
+                    current_user = (await db.execute(user_stmt)).scalar_one_or_none()
+                    if current_user is None:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": "UNAUTHORIZED", "message": "User not found."},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    try:
+                        membership = await assert_lounge_participant(db, lounge, current_user)
+                    except AppException as exc:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": exc.code, "message": exc.message},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    # Moderation check: muted user
+                    if current_user.id in membership.get("mutedUserIds", set()):
+                        is_host = (current_user.id == lounge.host_user_id)
+                        is_admin = (current_user.role == "admin")
+                        if not is_host and not is_admin:
+                            err_msg = make_ws_envelope(
+                                event="lounge.error",
+                                lounge_id=loungeId,
+                                payload={
+                                    "code": "USER_MUTED",
+                                    "message": "You have been muted by the Host and cannot send reactions.",
+                                },
+                            )
+                            await connection_manager.send_personal(websocket, err_msg)
+                            continue
+
+                    # Validate target message existence and ensure it belongs to this lounge
+                    msg_stmt = (
+                        select(ChatMessage)
+                        .where(ChatMessage.id == reaction_payload.messageId)
+                        .where(ChatMessage.lounge_id == loungeId)
+                    )
+                    target_msg = (await db.execute(msg_stmt)).scalar_one_or_none()
+                    if target_msg is None:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={
+                                "code": "MESSAGE_NOT_FOUND",
+                                "message": f"Target chat message '{reaction_payload.messageId}' not found in lounge '{loungeId}'.",
+                            },
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                # 4. In-memory reaction state transition and room broadcast (NO DB PERSISTENCE)
+                effective_action = connection_manager.record_reaction(
+                    lounge_id=loungeId,
+                    message_id=reaction_payload.messageId,
+                    user_id=user_id,
+                    emoji=reaction_payload.emoji,
+                    action=reaction_payload.action or "add",
+                )
+
+                if effective_action is not None:
+                    reaction_broadcast = make_ws_envelope(
+                        event="lounge.chat.reaction",
+                        lounge_id=loungeId,
+                        payload={
+                            "messageId": reaction_payload.messageId,
+                            "userId": user_id,
+                            "displayName": display_name,
+                            "emoji": reaction_payload.emoji,
+                            "action": effective_action,
+                        },
+                    )
+                    await connection_manager.broadcast(loungeId, reaction_broadcast)
 
             else:
                 err_msg = make_ws_envelope(

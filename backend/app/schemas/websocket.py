@@ -200,3 +200,60 @@ class LoungeChatTypingBroadcastPayload(BaseModel):
     displayName: Optional[str] = None
     isTyping: bool
     action: Literal["started", "stopped"]
+
+
+MAX_REACTION_EMOJI_LENGTH = 16
+
+
+class LoungeChatReactionPayload(BaseModel):
+    """Payload for client-to-server lounge.chat.reaction event (Module 8.3.3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messageId: str = Field(..., description="ID of the target chat message being reacted to")
+    emoji: str = Field(..., description="Unicode emoji character sequence (e.g. 🔥, ❤️, 👏)")
+    action: Optional[Literal["add", "remove", "toggle"]] = Field(
+        default="add",
+        description="Reaction action (default: add)",
+    )
+
+    @field_validator("messageId")
+    @classmethod
+    def validate_message_id(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("messageId must be a string.")
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("messageId cannot be empty.")
+        return cleaned
+
+    @field_validator("emoji")
+    @classmethod
+    def validate_emoji(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("emoji must be a string.")
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("emoji cannot be empty.")
+        if len(cleaned) > MAX_REACTION_EMOJI_LENGTH:
+            raise ValueError(
+                f"emoji cannot exceed {MAX_REACTION_EMOJI_LENGTH} characters."
+            )
+        # Disallow ASCII alphanumeric, spaces, and HTML/script injection characters
+        if re.search(r"[a-zA-Z0-9\s<>&\"'/]", cleaned):
+            raise ValueError(
+                "Invalid emoji: must be a unicode emoji and cannot contain alphanumeric, whitespace, or HTML characters."
+            )
+        return cleaned
+
+
+class LoungeChatReactionBroadcastPayload(BaseModel):
+    """Payload for server-to-client lounge.chat.reaction broadcasts (Module 8.3.3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messageId: str
+    userId: str
+    displayName: Optional[str] = None
+    emoji: str
+    action: Literal["add", "remove"]

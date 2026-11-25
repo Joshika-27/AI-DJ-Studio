@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -40,6 +40,8 @@ class WebSocketConnectionManager:
         self._grace_timers: Dict[str, Dict[str, asyncio.Task]] = {}
         # _typing_users[lounge_id] -> Set[user_id]
         self._typing_users: Dict[str, Set[str]] = {}
+        # _reactions[lounge_id][message_id][emoji] -> Set[user_id]
+        self._reactions: Dict[str, Dict[str, Dict[str, Set[str]]]] = {}
 
     def get_room_user_sessions(self, lounge_id: str) -> Dict[str, ConnectedUserSession]:
         """Return the dictionary of active user sessions in the given lounge."""
@@ -346,6 +348,55 @@ class WebSocketConnectionManager:
             return True
         return False
 
+    def record_reaction(
+        self,
+        lounge_id: str,
+        message_id: str,
+        user_id: str,
+        emoji: str,
+        action: str = "add",
+    ) -> Optional[Literal["add", "remove"]]:
+        """Record or toggle an in-memory emoji reaction on a message in a lounge.
+
+        Returns:
+            "add" if reaction was newly added, "remove" if removed,
+            or None if the requested state was already identical (deduplicated).
+        """
+        if lounge_id not in self._reactions:
+            self._reactions[lounge_id] = {}
+        if message_id not in self._reactions[lounge_id]:
+            self._reactions[lounge_id][message_id] = {}
+        if emoji not in self._reactions[lounge_id][message_id]:
+            self._reactions[lounge_id][message_id][emoji] = set()
+
+        reactors = self._reactions[lounge_id][message_id][emoji]
+
+        if action == "toggle":
+            if user_id in reactors:
+                reactors.remove(user_id)
+                return "remove"
+            else:
+                reactors.add(user_id)
+                return "add"
+        elif action == "remove":
+            if user_id in reactors:
+                reactors.remove(user_id)
+                return "remove"
+            return None
+        else:  # "add"
+            if user_id not in reactors:
+                reactors.add(user_id)
+                return "add"
+            return None
+
+    def get_message_reactions(
+        self,
+        lounge_id: str,
+        message_id: str,
+    ) -> Dict[str, Set[str]]:
+        """Return dict of emoji -> Set[user_id] for a message in a lounge."""
+        return self._reactions.get(lounge_id, {}).get(message_id, {})
+
     def clear_for_testing(self) -> None:
         """Helper to cancel all active grace tasks and reset all room state during test teardown."""
         for lounge_id, timers in list(self._grace_timers.items()):
@@ -355,6 +406,7 @@ class WebSocketConnectionManager:
         self._grace_timers.clear()
         self._rooms.clear()
         self._typing_users.clear()
+        self._reactions.clear()
 
 
 # Global singleton connection manager
