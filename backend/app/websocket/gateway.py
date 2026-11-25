@@ -23,9 +23,14 @@ from app.models.queue import QueueEntry, QueueEvent
 from app.models.user import User
 from app.schemas.lounge import format_iso_utc
 from app.schemas.queue import QueueVoteRequest
-from app.schemas.websocket import LoungeQueueVotePayload, make_ws_envelope
+from app.schemas.websocket import (
+    LoungeChatMessagePayload,
+    LoungeQueueVotePayload,
+    make_ws_envelope,
+)
 from app.services.lounge_service import (
     _reconstruct_lounge_membership,
+    send_lounge_chat_message,
     vote_track_in_lounge_queue,
 )
 from app.services.room_state_manager import room_state_manager
@@ -388,6 +393,75 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
                             event="lounge.error",
                             lounge_id=loungeId,
                             payload={"code": "INTERNAL_ERROR", "message": "Failed to process vote."},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+
+            elif event_name in ("lounge.chat.message", "lounge.chat.send"):
+                # Validate envelope loungeId requirement (REQ-060, REQ-063)
+                if not envelope_lounge_id:
+                    err_msg = make_ws_envelope(
+                        event="lounge.error",
+                        lounge_id=loungeId,
+                        payload={
+                            "code": "INVALID_PAYLOAD",
+                            "message": "Envelope 'loungeId' is required.",
+                        },
+                    )
+                    await connection_manager.send_personal(websocket, err_msg)
+                    continue
+
+                # Validate chat payload schema (REQ-063)
+                try:
+                    chat_payload = LoungeChatMessagePayload(**payload)
+                except (ValidationError, ValueError):
+                    err_msg = make_ws_envelope(
+                        event="lounge.error",
+                        lounge_id=loungeId,
+                        payload={
+                            "code": "INVALID_PAYLOAD",
+                            "message": "Malformed chat payload: body must be a valid non-empty string under 500 characters without extra fields.",
+                        },
+                    )
+                    await connection_manager.send_personal(websocket, err_msg)
+                    continue
+
+                # Execute authoritative chat persistence and broadcast via service logic
+                session_maker = get_session_maker()
+                async with session_maker() as db:
+                    user_stmt = select(User).where(User.id == user_id)
+                    current_user = (await db.execute(user_stmt)).scalar_one_or_none()
+                    if current_user is None:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": "UNAUTHORIZED", "message": "User not found."},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    try:
+                        await send_lounge_chat_message(
+                            db=db,
+                            lounge_id=loungeId,
+                            current_user=current_user,
+                            payload=chat_payload,
+                        )
+                    except AppException as exc:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": exc.code, "message": exc.message},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                    except Exception as exc:
+                        logger.error(
+                            f"Unexpected error processing WebSocket chat message in lounge '{loungeId}': {exc}",
+                            extra={"loungeId": loungeId, "userId": user_id, "error": str(exc)},
+                        )
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": "INTERNAL_ERROR", "message": "Failed to process chat message."},
                         )
                         await connection_manager.send_personal(websocket, err_msg)
 

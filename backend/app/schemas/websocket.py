@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.core.security import sanitize_text_input
 
 from app.schemas.queue import (
     NowPlayingTrackSchema,
@@ -133,3 +136,43 @@ class LoungeQueueVotePayload(QueueVoteRequest):
     """Payload for client-to-server lounge.queue.vote event (REQ-061, API_DESIGN Section 2.3)."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+MAX_CHAT_MESSAGE_LENGTH = 500
+
+
+class LoungeChatMessagePayload(BaseModel):
+    """Payload for client-to-server lounge.chat.message event (PRD Section 7.3.4, REQ-023, REQ-063)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    body: str = Field(..., description="Sanitized text content of the chat message")
+
+    @field_validator("body")
+    @classmethod
+    def validate_and_sanitize_body(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Message body must be a string.")
+        cleaned = sanitize_text_input(value)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+        if not cleaned:
+            raise ValueError("Message body cannot be empty or contain solely whitespace/tags.")
+        if len(cleaned) > MAX_CHAT_MESSAGE_LENGTH:
+            raise ValueError(
+                f"Message body cannot exceed {MAX_CHAT_MESSAGE_LENGTH} characters."
+            )
+        return cleaned
+
+
+class LoungeChatBroadcastPayload(BaseModel):
+    """Payload for server-to-client lounge.chat.message broadcasts (PRD Section 7.3.4, REQ-023)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messageId: str
+    userId: str
+    displayName: Optional[str] = None
+    body: str
+    sentimentBucket: Optional[str] = None
+    tsSeconds: int
+    createdAt: str

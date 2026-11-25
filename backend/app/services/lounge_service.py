@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 from app.core.exceptions import AppException
 from app.core.logging import get_logger
 from app.db.base import utc_now
+from app.models.chat import ChatMessage
 from app.models.lounge import DJLounge
 from app.models.queue import QueueEntry, QueueEvent
 from app.models.track import Track
@@ -48,7 +49,7 @@ from app.schemas.queue import (
     QueueVoteRequest,
 )
 from app.schemas.track import _format_bpm_value
-from app.schemas.websocket import make_ws_envelope
+from app.schemas.websocket import LoungeChatMessagePayload, make_ws_envelope
 from app.services.room_state_manager import RoomState, room_state_manager
 from app.websocket.connection_manager import connection_manager
 
@@ -1268,3 +1269,107 @@ async def get_lounge_queue_state(
     await assert_lounge_participant(db, lounge, current_user)
     state = await room_state_manager.get_or_hydrate_room(db, lounge_id)
     return state.to_queue_response()
+
+
+async def broadcast_chat_message(
+    lounge_id: str,
+    chat_message: ChatMessage,
+    display_name: str | None = None,
+) -> None:
+    """Broadcast an authoritative chat message update to all connected WebSocket clients in the lounge (REQ-023, REQ-063).
+
+    Guarantees:
+    - Broadcast occurs strictly after successful database commit.
+    - Uses canonical WebSocket envelope {event, loungeId, payload, ts}.
+    - Broadcast errors are caught and logged so they never fail or undo committed database mutations.
+    """
+    try:
+        payload = {
+            "messageId": chat_message.id,
+            "userId": chat_message.user_id,
+            "displayName": display_name or f"User {chat_message.user_id}",
+            "body": chat_message.body,
+            "sentimentBucket": chat_message.sentiment_bucket,
+            "tsSeconds": chat_message.ts_seconds,
+            "createdAt": format_iso_utc(chat_message.created_at) or "",
+        }
+        envelope = make_ws_envelope(
+            event="lounge.chat.message",
+            lounge_id=lounge_id,
+            payload=payload,
+        )
+        await connection_manager.broadcast(lounge_id, envelope)
+    except Exception as exc:
+        logger.warning(
+            f"Failed to broadcast chat message for lounge '{lounge_id}': {exc}",
+            extra={"loungeId": lounge_id, "error": str(exc)},
+        )
+
+
+async def send_lounge_chat_message(
+    db: AsyncSession,
+    lounge_id: str,
+    current_user: User,
+    payload: LoungeChatMessagePayload,
+) -> ChatMessage:
+    """Validate membership, persist ChatMessage with row-level safety, and broadcast (REQ-023, REQ-063)."""
+    lounge = await _load_lounge_with_relations(db, lounge_id)
+    if lounge.status == "ended":
+        raise AppException(
+            message="Cannot send chat messages to an ended DJ Lounge.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="LOUNGE_ENDED",
+        )
+
+    membership = await assert_lounge_participant(db, lounge, current_user)
+
+    # Check if participant is muted
+    if current_user.id in membership.get("mutedUserIds", set()):
+        is_host = (current_user.id == lounge.host_user_id)
+        is_admin = (current_user.role == "admin")
+        if not is_host and not is_admin:
+            raise AppException(
+                message="You have been muted by the Host and cannot send chat messages.",
+                status_code=status.HTTP_403_FORBIDDEN,
+                code="USER_MUTED",
+            )
+
+    now_dt = utc_now()
+    created_dt = lounge.created_at
+    if created_dt.tzinfo is None:
+        created_dt = created_dt.replace(tzinfo=timezone.utc)
+    ts_seconds = max(0, int((now_dt - created_dt).total_seconds()))
+
+    chat_msg = ChatMessage(
+        id=f"msg_{uuid.uuid4().hex[:10]}",
+        lounge_id=lounge.id,
+        user_id=current_user.id,
+        msg_type="chat",
+        body=payload.body,
+        sentiment_score=None,
+        sentiment_bucket=None,
+        source_events=[],
+        ts_seconds=ts_seconds,
+        created_at=now_dt,
+    )
+    db.add(chat_msg)
+
+    try:
+        await db.commit()
+        await db.refresh(chat_msg)
+    except Exception as exc:
+        await db.rollback()
+        logger.error(f"Failed to persist chat message in lounge '{lounge_id}': {exc}", exc_info=exc)
+        raise AppException(
+            message="Failed to persist chat message.",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            code="PERSISTENCE_FAILED",
+        ) from exc
+
+    display_name = current_user.display_name or f"User {current_user.id}"
+    await broadcast_chat_message(
+        lounge_id=lounge_id,
+        chat_message=chat_msg,
+        display_name=display_name,
+    )
+    return chat_msg
