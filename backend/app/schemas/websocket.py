@@ -6,7 +6,7 @@ import re
 import time
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from app.core.security import sanitize_text_input
 
@@ -176,3 +176,27 @@ class LoungeChatBroadcastPayload(BaseModel):
     sentimentBucket: Optional[str] = None
     tsSeconds: int
     createdAt: str
+
+
+class LoungeChatTypingPayload(BaseModel):
+    """Payload for client-to-server lounge.chat.typing event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    isTyping: Optional[StrictBool] = None
+    action: Optional[Literal["started", "stopped", "start", "stop"]] = None
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.isTyping is None and self.action is None:
+            raise ValueError("Either 'isTyping' or 'action' must be provided.")
+
+
+class LoungeChatTypingBroadcastPayload(BaseModel):
+    """Payload for server-to-client lounge.chat.typing broadcasts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    userId: str
+    displayName: Optional[str] = None
+    isTyping: bool
+    action: Literal["started", "stopped"]

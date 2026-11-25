@@ -38,6 +38,8 @@ class WebSocketConnectionManager:
         self._rooms: Dict[str, Dict[str, ConnectedUserSession]] = {}
         # _grace_timers[lounge_id][user_id] -> asyncio.Task
         self._grace_timers: Dict[str, Dict[str, asyncio.Task]] = {}
+        # _typing_users[lounge_id] -> Set[user_id]
+        self._typing_users: Dict[str, Set[str]] = {}
 
     def get_room_user_sessions(self, lounge_id: str) -> Dict[str, ConnectedUserSession]:
         """Return the dictionary of active user sessions in the given lounge."""
@@ -313,6 +315,37 @@ class WebSocketConnectionManager:
         """Send a WebSocket envelope directly to a single socket client."""
         await websocket.send_json(message)
 
+    def set_user_typing(self, lounge_id: str, user_id: str, is_typing: bool) -> bool:
+        """Update in-memory typing state for a user in a lounge with deduplication.
+
+        Returns:
+            bool: True if the state changed (i.e. broadcast should be sent), False if unchanged (throttled).
+        """
+        if lounge_id not in self._typing_users:
+            self._typing_users[lounge_id] = set()
+
+        current = user_id in self._typing_users[lounge_id]
+        if is_typing == current:
+            return False  # State unchanged; deduplicated
+
+        if is_typing:
+            self._typing_users[lounge_id].add(user_id)
+        else:
+            self._typing_users[lounge_id].discard(user_id)
+        return True
+
+    def is_user_typing(self, lounge_id: str, user_id: str) -> bool:
+        """Check if a user is currently marked as typing in a lounge."""
+        return user_id in self._typing_users.get(lounge_id, set())
+
+    def clear_user_typing(self, lounge_id: str, user_id: str) -> bool:
+        """Clear typing state for a user (e.g. on disconnect or message sent). Returns True if user was typing."""
+        room_typing = self._typing_users.get(lounge_id)
+        if room_typing and user_id in room_typing:
+            room_typing.discard(user_id)
+            return True
+        return False
+
     def clear_for_testing(self) -> None:
         """Helper to cancel all active grace tasks and reset all room state during test teardown."""
         for lounge_id, timers in list(self._grace_timers.items()):
@@ -321,6 +354,7 @@ class WebSocketConnectionManager:
                     task.cancel()
         self._grace_timers.clear()
         self._rooms.clear()
+        self._typing_users.clear()
 
 
 # Global singleton connection manager

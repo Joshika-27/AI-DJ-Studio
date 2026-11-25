@@ -25,11 +25,13 @@ from app.schemas.lounge import format_iso_utc
 from app.schemas.queue import QueueVoteRequest
 from app.schemas.websocket import (
     LoungeChatMessagePayload,
+    LoungeChatTypingPayload,
     LoungeQueueVotePayload,
     make_ws_envelope,
 )
 from app.services.lounge_service import (
     _reconstruct_lounge_membership,
+    assert_lounge_participant,
     send_lounge_chat_message,
     vote_track_in_lounge_queue,
 )
@@ -446,6 +448,7 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
                             current_user=current_user,
                             payload=chat_payload,
                         )
+                        connection_manager.clear_user_typing(loungeId, user_id)
                     except AppException as exc:
                         err_msg = make_ws_envelope(
                             event="lounge.error",
@@ -464,6 +467,146 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
                             payload={"code": "INTERNAL_ERROR", "message": "Failed to process chat message."},
                         )
                         await connection_manager.send_personal(websocket, err_msg)
+
+            elif event_name in (
+                "lounge.chat.typing",
+                "lounge.chat.typing_start",
+                "lounge.chat.typing.start",
+                "lounge.chat.typing_stop",
+                "lounge.chat.typing.stop",
+            ):
+                # 1. Cross-lounge isolation check
+                if not envelope_lounge_id:
+                    err_msg = make_ws_envelope(
+                        event="lounge.error",
+                        lounge_id=loungeId,
+                        payload={
+                            "code": "INVALID_PAYLOAD",
+                            "message": "Envelope 'loungeId' is required.",
+                        },
+                    )
+                    await connection_manager.send_personal(websocket, err_msg)
+                    continue
+
+                # 2. Determine is_typing boolean and validate payload
+                if event_name in ("lounge.chat.typing_start", "lounge.chat.typing.start"):
+                    is_typing = True
+                    if payload and any(k in payload for k in ("userId", "role", "displayName", "body")):
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={
+                                "code": "INVALID_PAYLOAD",
+                                "message": "Disallowed client-supplied fields in typing payload.",
+                            },
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+                elif event_name in ("lounge.chat.typing_stop", "lounge.chat.typing.stop"):
+                    is_typing = False
+                    if payload and any(k in payload for k in ("userId", "role", "displayName", "body")):
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={
+                                "code": "INVALID_PAYLOAD",
+                                "message": "Disallowed client-supplied fields in typing payload.",
+                            },
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+                else:
+                    # Generic lounge.chat.typing
+                    try:
+                        typing_payload = LoungeChatTypingPayload(**payload)
+                    except (ValidationError, ValueError):
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={
+                                "code": "INVALID_PAYLOAD",
+                                "message": "Malformed typing payload: 'isTyping' (bool) or 'action' ('started'|'stopped') is required without extra fields.",
+                            },
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    if typing_payload.isTyping is not None:
+                        is_typing = typing_payload.isTyping
+                    elif typing_payload.action in ("started", "start"):
+                        is_typing = True
+                    else:
+                        is_typing = False
+
+                # 3. Authorization check via DB (membership, kicked, muted, ended)
+                session_maker = get_session_maker()
+                async with session_maker() as db:
+                    lounge_stmt = select(DJLounge).where(DJLounge.id == loungeId)
+                    lounge = (await db.execute(lounge_stmt)).scalar_one_or_none()
+                    if lounge is None or lounge.status == "ended":
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={
+                                "code": "LOUNGE_ENDED" if lounge and lounge.status == "ended" else "LOUNGE_NOT_FOUND",
+                                "message": "Cannot send typing events for this lounge.",
+                            },
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    user_stmt = select(User).where(User.id == user_id)
+                    current_user = (await db.execute(user_stmt)).scalar_one_or_none()
+                    if current_user is None:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": "UNAUTHORIZED", "message": "User not found."},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    try:
+                        membership = await assert_lounge_participant(db, lounge, current_user)
+                    except AppException as exc:
+                        err_msg = make_ws_envelope(
+                            event="lounge.error",
+                            lounge_id=loungeId,
+                            payload={"code": exc.code, "message": exc.message},
+                        )
+                        await connection_manager.send_personal(websocket, err_msg)
+                        continue
+
+                    # Check if muted
+                    if current_user.id in membership.get("mutedUserIds", set()):
+                        is_host = (current_user.id == lounge.host_user_id)
+                        is_admin = (current_user.role == "admin")
+                        if not is_host and not is_admin:
+                            err_msg = make_ws_envelope(
+                                event="lounge.error",
+                                lounge_id=loungeId,
+                                payload={
+                                    "code": "USER_MUTED",
+                                    "message": "You have been muted by the Host and cannot send typing events.",
+                                },
+                            )
+                            await connection_manager.send_personal(websocket, err_msg)
+                            continue
+
+                # 4. State deduplication and room broadcast (NO DB PERSISTENCE)
+                changed = connection_manager.set_user_typing(loungeId, user_id, is_typing)
+                if changed:
+                    typing_broadcast = make_ws_envelope(
+                        event="lounge.chat.typing",
+                        lounge_id=loungeId,
+                        payload={
+                            "userId": user_id,
+                            "displayName": display_name,
+                            "isTyping": is_typing,
+                            "action": "started" if is_typing else "stopped",
+                        },
+                    )
+                    await connection_manager.broadcast(loungeId, typing_broadcast)
 
             else:
                 err_msg = make_ws_envelope(
@@ -486,4 +629,17 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
             extra={"loungeId": loungeId, "userId": user_id, "error": str(exc)},
         )
     finally:
+        # If user was typing when socket disconnected, broadcast typing-stop
+        if connection_manager.clear_user_typing(loungeId, user_id):
+            typing_stop_msg = make_ws_envelope(
+                event="lounge.chat.typing",
+                lounge_id=loungeId,
+                payload={
+                    "userId": user_id,
+                    "displayName": display_name,
+                    "isTyping": False,
+                    "action": "stopped",
+                },
+            )
+            await connection_manager.broadcast(loungeId, typing_stop_msg)
         await connection_manager.disconnect(loungeId, user_id, websocket)
