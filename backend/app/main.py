@@ -12,6 +12,7 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.health import router as health_router
 from app.api.v1.lounges import router as lounges_router
 from app.api.v1.tracks import router as tracks_router
+from app.websocket.gateway import router as ws_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import (
@@ -113,6 +114,9 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(tracks_router, prefix="/api/v1")
     app.include_router(lounges_router, prefix="/api/v1")
+
+    # 6. Register WebSocket router (Module 8: Real-Time Queue & Presence Gateway)
+    app.include_router(ws_router)
 
     return app
 
