@@ -48,7 +48,9 @@ from app.schemas.queue import (
     QueueVoteRequest,
 )
 from app.schemas.track import _format_bpm_value
-from app.services.room_state_manager import room_state_manager
+from app.schemas.websocket import make_ws_envelope
+from app.services.room_state_manager import RoomState, room_state_manager
+from app.websocket.connection_manager import connection_manager
 
 logger = get_logger("services.lounge")
 
@@ -1107,6 +1109,44 @@ async def assert_lounge_participant(
     return membership
 
 
+async def broadcast_queue_update(
+    lounge_id: str,
+    room_state: RoomState,
+    reason: str,
+) -> None:
+    """Broadcast an authoritative queue state update to all connected WebSocket clients in the lounge (REQ-061).
+
+    Guarantees:
+    - Broadcast occurs strictly after successful database commit.
+    - Uses canonical WebSocket envelope {event, loungeId, payload, ts}.
+    - Broadcast errors are caught and logged so they never fail or undo committed database mutations.
+    """
+    try:
+        queue_data = [entry.to_schema().model_dump() for entry in room_state.next_up]
+        now_playing_data = (
+            room_state.now_playing.to_schema().model_dump()
+            if room_state.now_playing
+            else None
+        )
+        payload = {
+            "queue": queue_data,
+            "nowPlaying": now_playing_data,
+            "reason": reason,
+            "version": room_state.queue_version,
+        }
+        envelope = make_ws_envelope(
+            event="lounge.queue.update",
+            lounge_id=lounge_id,
+            payload=payload,
+        )
+        await connection_manager.broadcast(lounge_id, envelope)
+    except Exception as exc:
+        logger.warning(
+            f"Failed to broadcast queue update for lounge '{lounge_id}': {exc}",
+            extra={"loungeId": lounge_id, "error": str(exc)},
+        )
+
+
 async def add_track_to_lounge_queue(
     db: AsyncSession,
     lounge_id: str,
@@ -1123,6 +1163,7 @@ async def add_track_to_lounge_queue(
         track_id=payload.trackId,
         user_id=current_user.id,
     )
+    await broadcast_queue_update(lounge_id=lounge_id, room_state=state, reason="add")
     return state.to_queue_response()
 
 async def vote_track_in_lounge_queue(
@@ -1141,6 +1182,7 @@ async def vote_track_in_lounge_queue(
         track_id=payload.trackId,
         user_id=current_user.id,
     )
+    await broadcast_queue_update(lounge_id=lounge_id, room_state=state, reason="vote")
     return state.to_queue_response()
 
 async def override_lounge_queue(
@@ -1183,6 +1225,7 @@ async def override_lounge_queue(
             user_id=current_user.id,
             target_position=payload.targetPosition,
         )
+        reason = "override"
     elif action == "remove":
         if not payload.trackId:
             raise AppException(
@@ -1196,6 +1239,7 @@ async def override_lounge_queue(
             track_id=payload.trackId,
             user_id=current_user.id,
         )
+        reason = "override"
     elif action == "force_segue":
         state = await room_state_manager.force_segue(
             db=db,
@@ -1203,6 +1247,7 @@ async def override_lounge_queue(
             user_id=current_user.id,
             target_track_id=payload.trackId,
         )
+        reason = "segue"
     else:
         raise AppException(
             message=f"Unsupported queue override action '{action}'.",
@@ -1210,6 +1255,7 @@ async def override_lounge_queue(
             code="INVALID_ACTION",
         )
 
+    await broadcast_queue_update(lounge_id=lounge_id, room_state=state, reason=reason)
     return state.to_queue_response()
 
 async def get_lounge_queue_state(

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.queue import NowPlayingTrackSchema, QueueItemSchema
 
 
 def make_ws_envelope(
@@ -110,3 +112,14 @@ class LoungeErrorPayload(BaseModel):
 
     code: str
     message: str
+
+
+class LoungeQueueUpdatePayload(BaseModel):
+    """Payload for lounge.queue.update broadcasts (REQ-061)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    queue: List[QueueItemSchema]
+    nowPlaying: Optional[NowPlayingTrackSchema] = None
+    reason: Literal["vote", "add", "segue", "battle", "override"]
+    version: int
