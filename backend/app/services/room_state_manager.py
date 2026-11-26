@@ -44,7 +44,7 @@ import asyncio
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 import uuid
 
 from fastapi import status
@@ -240,6 +240,9 @@ class RoomStateManager:
     def __init__(self) -> None:
         self._rooms: Dict[str, RoomState] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._frozen_lounges: Set[str] = set()
+        self._host_status: Dict[str, str] = {}
+        self._active_host_user_id: Dict[str, str] = {}
 
     def get_room_lock(self, lounge_id: str) -> asyncio.Lock:
         """Retrieve or create an in-process asyncio.Lock for the specified lounge."""
@@ -249,10 +252,47 @@ class RoomStateManager:
             self._locks[lounge_id] = lock
         return lock
 
+    def is_mutations_frozen(self, lounge_id: str) -> bool:
+        """Check if queue mutations are frozen for a lounge (REQ-029)."""
+        return lounge_id in self._frozen_lounges
+
+    def set_mutations_frozen(self, lounge_id: str, frozen: bool) -> None:
+        """Freeze or unfreeze queue mutations for a lounge (REQ-029)."""
+        if frozen:
+            self._frozen_lounges.add(lounge_id)
+        else:
+            self._frozen_lounges.discard(lounge_id)
+
+    def get_host_status(self, lounge_id: str) -> str:
+        """Get current host status for a lounge ('connected' | 'host_disconnected' | 'ended')."""
+        return self._host_status.get(lounge_id, "connected")
+
+    def set_host_status(self, lounge_id: str, host_status: str) -> None:
+        """Set current host status for a lounge."""
+        self._host_status[lounge_id] = host_status
+
+    def get_active_host_user_id(self, lounge_id: str) -> Optional[str]:
+        """Get active host user ID for a lounge."""
+        return self._active_host_user_id.get(lounge_id)
+
+    def set_active_host_user_id(self, lounge_id: str, host_user_id: str) -> None:
+        """Set active host user ID for a lounge."""
+        self._active_host_user_id[lounge_id] = host_user_id
+
+    def clear_room_state(self, lounge_id: str) -> None:
+        """Purge all in-memory state for an ended lounge."""
+        self._rooms.pop(lounge_id, None)
+        self._frozen_lounges.discard(lounge_id)
+        self._host_status.pop(lounge_id, None)
+        self._active_host_user_id.pop(lounge_id, None)
+
     def clear_cache_for_testing(self) -> None:
         """Test helper to clear all in-memory room states and locks."""
         self._rooms.clear()
         self._locks.clear()
+        self._frozen_lounges.clear()
+        self._host_status.clear()
+        self._active_host_user_id.clear()
 
     # --------------------------------------------------------------------------
     # Deterministic Sorting & Sparse Positioning Algorithms

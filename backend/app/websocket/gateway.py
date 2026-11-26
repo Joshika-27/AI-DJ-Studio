@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, Optional
 import uuid
 
+import anyio
 from fastapi import APIRouter
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -34,6 +35,8 @@ from app.schemas.websocket import (
 from app.services.lounge_service import (
     _reconstruct_lounge_membership,
     assert_lounge_participant,
+    handle_host_disconnect,
+    handle_host_reconnect,
     send_lounge_chat_message,
     vote_track_in_lounge_queue,
 )
@@ -200,7 +203,6 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
             active_joined_at[user_id] = format_iso_utc(join_dt) or ""
             if user_id not in participant_roles:
                 participant_roles[user_id] = user_obj.role
-
         # Hydrate RoomState via authoritative RoomStateManager
         room_state = await room_state_manager.get_or_hydrate_room(db, lounge.id)
 
@@ -253,8 +255,26 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
         websocket=websocket,
     )
 
+    # 5b. If reconnecting host and mutations were frozen, restore host status and unfreeze (REQ-029)
+    if room_state_manager.is_mutations_frozen(loungeId):
+        active_host = room_state_manager.get_active_host_user_id(loungeId) or lounge.host_user_id
+        if user_id == active_host:
+            session_maker = get_session_maker()
+            async with session_maker() as db_reconnect:
+                await handle_host_reconnect(
+                    db=db_reconnect,
+                    lounge_id=loungeId,
+                    reconnected_user_id=user_id,
+                    exclude_ws=websocket,
+                )
+
     # 6. Deliver immediate mid-session snapshot to this client (REQ-028)
-    host_status = connection_manager.get_host_status(loungeId, lounge.host_user_id)
+    active_host_id = room_state_manager.get_active_host_user_id(loungeId) or lounge.host_user_id
+    host_status = (
+        "host_disconnected"
+        if room_state_manager.is_mutations_frozen(loungeId) or not connection_manager.is_user_connected(loungeId, active_host_id)
+        else "connected"
+    )
     snapshot_msg = make_ws_envelope(
         event="lounge.state.snapshot",
         lounge_id=loungeId,
@@ -757,17 +777,27 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
             extra={"loungeId": loungeId, "userId": user_id, "error": str(exc)},
         )
     finally:
-        # If user was typing when socket disconnected, broadcast typing-stop
-        if connection_manager.clear_user_typing(loungeId, user_id):
-            typing_stop_msg = make_ws_envelope(
-                event="lounge.chat.typing",
-                lounge_id=loungeId,
-                payload={
-                    "userId": user_id,
-                    "displayName": display_name,
-                    "isTyping": False,
-                    "action": "stopped",
-                },
-            )
-            await connection_manager.broadcast(loungeId, typing_stop_msg)
-        await connection_manager.disconnect(loungeId, user_id, websocket)
+        with anyio.CancelScope(shield=True):
+            # If user was typing when socket disconnected, broadcast typing-stop
+            if connection_manager.clear_user_typing(loungeId, user_id):
+                typing_stop_msg = make_ws_envelope(
+                    event="lounge.chat.typing",
+                    lounge_id=loungeId,
+                    payload={
+                        "userId": user_id,
+                        "displayName": display_name,
+                        "isTyping": False,
+                        "action": "stopped",
+                    },
+                )
+                await connection_manager.broadcast(loungeId, typing_stop_msg)
+            await connection_manager.disconnect(loungeId, user_id, websocket)
+
+            # Module 8.4: Check for Host disconnect handling (REQ-029)
+            session_maker = get_session_maker()
+            async with session_maker() as db_disconnect:
+                await handle_host_disconnect(
+                    db=db_disconnect,
+                    lounge_id=loungeId,
+                    disconnected_user_id=user_id,
+                )

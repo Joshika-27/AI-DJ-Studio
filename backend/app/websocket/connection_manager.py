@@ -397,6 +397,16 @@ class WebSocketConnectionManager:
         """Return dict of emoji -> Set[user_id] for a message in a lounge."""
         return self._reactions.get(lounge_id, {}).get(message_id, {})
 
+    def clear_lounge(self, lounge_id: str) -> None:
+        """Purge all in-memory connections, timers, typing, and reaction state for a lounge."""
+        timers = self._grace_timers.pop(lounge_id, {})
+        for uid, task in list(timers.items()):
+            if not task.done():
+                task.cancel()
+        self._rooms.pop(lounge_id, None)
+        self._typing_users.pop(lounge_id, None)
+        self._reactions.pop(lounge_id, None)
+
     def clear_for_testing(self) -> None:
         """Helper to cancel all active grace tasks and reset all room state during test teardown."""
         for lounge_id, timers in list(self._grace_timers.items()):

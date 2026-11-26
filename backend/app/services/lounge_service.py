@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import re
 import secrets
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import uuid
 
 from fastapi import status
@@ -832,6 +832,8 @@ async def end_lounge(
             db.add(end_event)
             await db.commit()
             await db.refresh(lounge)
+            room_state_manager.clear_room_state(lounge.id)
+            connection_manager.clear_lounge(lounge.id)
 
         created_dt = lounge.created_at
         ended_dt = lounge.ended_at or utc_now()
@@ -1155,6 +1157,12 @@ async def add_track_to_lounge_queue(
     payload: QueueAddRequest,
 ) -> QueueResponse:
     """Add a track to the Next Up queue of a DJ Lounge (REQ-020, REQ-054)."""
+    if room_state_manager.is_mutations_frozen(lounge_id):
+        raise AppException(
+            message="Queue mutations are frozen while host is disconnected.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="MUTATIONS_FROZEN",
+        )
     lounge = await _load_lounge_with_relations(db, lounge_id)
     await assert_lounge_participant(db, lounge, current_user)
 
@@ -1174,6 +1182,12 @@ async def vote_track_in_lounge_queue(
     payload: QueueVoteRequest,
 ) -> QueueResponse:
     """Upvote a track in Next Up queue (REQ-021, REQ-027)."""
+    if room_state_manager.is_mutations_frozen(lounge_id):
+        raise AppException(
+            message="Queue mutations are frozen while host is disconnected.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="MUTATIONS_FROZEN",
+        )
     lounge = await _load_lounge_with_relations(db, lounge_id)
     await assert_lounge_participant(db, lounge, current_user)
 
@@ -1193,6 +1207,12 @@ async def override_lounge_queue(
     payload: QueueOverrideRequest,
 ) -> QueueResponse:
     """Execute manual Host/Co-DJ/Admin queue override actions (promote, remove, force_segue) (REQ-015, REQ-070)."""
+    if room_state_manager.is_mutations_frozen(lounge_id):
+        raise AppException(
+            message="Queue mutations are frozen while host is disconnected.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="MUTATIONS_FROZEN",
+        )
     lounge = await _load_lounge_with_relations(db, lounge_id)
     membership = await assert_lounge_participant(db, lounge, current_user)
 
@@ -1373,3 +1393,156 @@ async def send_lounge_chat_message(
         display_name=display_name,
     )
     return chat_msg
+
+
+async def handle_host_disconnect(
+    db: AsyncSession,
+    lounge_id: str,
+    disconnected_user_id: str,
+) -> Optional[Dict[str, Any]]:
+    stmt = select(DJLounge).where(DJLounge.id == lounge_id)
+    lounge = (await db.execute(stmt)).scalar_one_or_none()
+    if not lounge or lounge.status == "ended":
+        return None
+
+    active_host_id = room_state_manager.get_active_host_user_id(lounge_id) or lounge.host_user_id
+    if disconnected_user_id != active_host_id:
+        return None
+
+    # Re-check socket presence: if user still has another active tab/socket, do not disconnect
+    if connection_manager.is_user_connected(lounge_id, disconnected_user_id):
+        return None
+
+    # Idempotence: If room is already in host_disconnected state and mutations are frozen, suppress duplicate broadcast
+    if (
+        room_state_manager.get_host_status(lounge_id) == "host_disconnected"
+        and room_state_manager.is_mutations_frozen(lounge_id)
+    ):
+        return None
+
+    # Reconstruct membership to find eligible Co-DJs
+    membership = await _reconstruct_lounge_membership(db, lounge)
+    participant_roles = membership["participantRoles"]
+    active_joined_at = membership["activeJoinedAt"]
+    removed_user_ids = membership["removedUserIds"]
+
+    # Eligible Co-DJs: role is co_dj, member of lounge, not removed/kicked, and currently connected
+    eligible_co_djs = [
+        uid for uid in active_joined_at
+        if participant_roles.get(uid) == "co_dj"
+        and uid not in removed_user_ids
+        and connection_manager.is_user_connected(lounge_id, uid)
+    ]
+
+    if eligible_co_djs:
+        # Deterministic selection: earliest joined_at, then user_id tie-breaker
+        eligible_co_djs.sort(key=lambda uid: (active_joined_at.get(uid, ""), uid))
+        promoted_user_id = eligible_co_djs[0]
+
+        # Update DB lounge host ownership
+        lounge.host_user_id = promoted_user_id
+
+        # Record moderation presence event
+        db.add(QueueEvent(
+            id=f"qev_{uuid.uuid4().hex[:10]}",
+            lounge_id=lounge.id,
+            user_id=promoted_user_id,
+            event_type="presence",
+            payload={
+                "action": "role_updated",
+                "moderationAction": "co_dj_promoted",
+                "targetUserId": promoted_user_id,
+                "participantId": promoted_user_id,
+                "newRole": "host",
+                "previousHostUserId": disconnected_user_id,
+                "participantCount": len(active_joined_at),
+            },
+            ts=_next_event_ts_ms(),
+            created_at=utc_now(),
+        ))
+        await db.commit()
+
+        # Update in-memory state
+        room_state_manager.set_active_host_user_id(lounge_id, promoted_user_id)
+        room_state_manager.set_host_status(lounge_id, "connected")
+        room_state_manager.set_mutations_frozen(lounge_id, False)
+
+        host_status_payload = {
+            "status": "co_dj_promoted",
+            "activeHostUserId": promoted_user_id,
+            "mutationsFrozen": False,
+        }
+        envelope = make_ws_envelope(
+            event="lounge.host.status",
+            lounge_id=lounge_id,
+            payload=host_status_payload,
+        )
+        await connection_manager.broadcast(lounge_id, envelope)
+        logger.info(
+            f"Co-DJ '{promoted_user_id}' promoted to Host in lounge '{lounge_id}' after host disconnect",
+            extra={"loungeId": lounge_id, "promotedUserId": promoted_user_id},
+        )
+        return host_status_payload
+    else:
+        # No eligible Co-DJ: enter host_disconnected and freeze mutations
+        room_state_manager.set_active_host_user_id(lounge_id, disconnected_user_id)
+        room_state_manager.set_host_status(lounge_id, "host_disconnected")
+        room_state_manager.set_mutations_frozen(lounge_id, True)
+
+        host_status_payload = {
+            "status": "host_disconnected",
+            "activeHostUserId": disconnected_user_id,
+            "mutationsFrozen": True,
+        }
+        envelope = make_ws_envelope(
+            event="lounge.host.status",
+            lounge_id=lounge_id,
+            payload=host_status_payload,
+        )
+        await connection_manager.broadcast(lounge_id, envelope)
+        logger.info(
+            f"Lounge '{lounge_id}' entered 'host_disconnected' state; queue mutations frozen",
+            extra={"loungeId": lounge_id, "hostUserId": disconnected_user_id},
+        )
+        return host_status_payload
+
+
+async def handle_host_reconnect(
+    db: AsyncSession,
+    lounge_id: str,
+    reconnected_user_id: str,
+    exclude_ws: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Handle Host reconnection when mutations were frozen (REQ-029, REQ-078)."""
+    # If not frozen, nothing to unfreeze
+    if not room_state_manager.is_mutations_frozen(lounge_id):
+        return None
+
+    active_host = room_state_manager.get_active_host_user_id(lounge_id)
+    lounge = await _load_lounge_with_relations(db, lounge_id)
+    expected_host = active_host or (lounge.host_user_id if lounge else None)
+
+    if reconnected_user_id != expected_host:
+        return None
+
+    # Unfreeze mutations and restore host status
+    room_state_manager.set_mutations_frozen(lounge_id, False)
+    room_state_manager.set_host_status(lounge_id, "connected")
+    room_state_manager.set_active_host_user_id(lounge_id, reconnected_user_id)
+
+    host_status_payload = {
+        "status": "host_reconnected",
+        "activeHostUserId": reconnected_user_id,
+        "mutationsFrozen": False,
+    }
+    envelope = make_ws_envelope(
+        event="lounge.host.status",
+        lounge_id=lounge_id,
+        payload=host_status_payload,
+    )
+    await connection_manager.broadcast(lounge_id, envelope, exclude_ws=exclude_ws)
+    logger.info(
+        f"Host '{reconnected_user_id}' reconnected to lounge '{lounge_id}'; queue mutations unfrozen",
+        extra={"loungeId": lounge_id, "hostUserId": reconnected_user_id},
+    )
+    return host_status_payload

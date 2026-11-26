@@ -257,3 +257,13 @@ class LoungeChatReactionBroadcastPayload(BaseModel):
     displayName: Optional[str] = None
     emoji: str
     action: Literal["add", "remove"]
+
+
+class LoungeHostStatusPayload(BaseModel):
+    """Payload for server-to-room lounge.host.status broadcast (Module 8.4 — REQ-029)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["host_disconnected", "host_reconnected", "co_dj_promoted"]
+    activeHostUserId: Optional[str] = None
+    mutationsFrozen: bool = False
