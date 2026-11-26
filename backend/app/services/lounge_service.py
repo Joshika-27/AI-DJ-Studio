@@ -51,6 +51,7 @@ from app.schemas.queue import (
 from app.schemas.track import _format_bpm_value
 from app.schemas.websocket import LoungeChatMessagePayload, make_ws_envelope
 from app.services.room_state_manager import RoomState, room_state_manager
+from app.websocket.batch_persistence import batch_persistence
 from app.websocket.connection_manager import connection_manager
 
 logger = get_logger("services.lounge")
@@ -748,6 +749,7 @@ async def start_lounge(
     lock = _get_lounge_lock(lounge_id)
     async with lock:
         lounge = await _load_lounge_with_relations(db, lounge_id, for_update=True)
+        total_queue_entries = len(lounge.queue_entries or [])
         membership = await _reconstruct_lounge_membership(db, lounge)
         _assert_host_of_lounge_or_admin(
             lounge, current_user, membership["participantRoles"]
@@ -806,6 +808,7 @@ async def end_lounge(
     lock = _get_lounge_lock(lounge_id)
     async with lock:
         lounge = await _load_lounge_with_relations(db, lounge_id, for_update=True)
+        total_queue_entries = len(lounge.queue_entries or [])
         membership = await _reconstruct_lounge_membership(db, lounge)
         _assert_host_of_lounge_or_admin(
             lounge, current_user, membership["participantRoles"]
@@ -832,6 +835,7 @@ async def end_lounge(
             db.add(end_event)
             await db.commit()
             await db.refresh(lounge)
+            await batch_persistence.flush_lounge(lounge.id)
             room_state_manager.clear_room_state(lounge.id)
             connection_manager.clear_lounge(lounge.id)
 
@@ -862,7 +866,7 @@ async def end_lounge(
             summary=LoungeEndSummarySchema(
                 durationSeconds=duration_sec,
                 peakConcurrentParticipants=lounge.peak_participants,
-                totalQueueEntries=len(lounge.queue_entries or []),
+                totalQueueEntries=total_queue_entries,
             ),
         )
 
@@ -877,6 +881,7 @@ async def moderate_lounge(
     lock = _get_lounge_lock(lounge_id)
     async with lock:
         lounge = await _load_lounge_with_relations(db, lounge_id, for_update=True)
+        total_queue_entries = len(lounge.queue_entries or [])
         membership = await _reconstruct_lounge_membership(db, lounge)
         _assert_host_of_lounge_or_admin(
             lounge, current_user, membership["participantRoles"]
@@ -1331,6 +1336,7 @@ async def send_lounge_chat_message(
     lounge_id: str,
     current_user: User,
     payload: LoungeChatMessagePayload,
+    use_batch_persistence: bool = False,
 ) -> ChatMessage:
     """Validate membership, persist ChatMessage with row-level safety, and broadcast (REQ-023, REQ-063)."""
     lounge = await _load_lounge_with_relations(db, lounge_id)
@@ -1372,19 +1378,22 @@ async def send_lounge_chat_message(
         ts_seconds=ts_seconds,
         created_at=now_dt,
     )
-    db.add(chat_msg)
 
-    try:
-        await db.commit()
-        await db.refresh(chat_msg)
-    except Exception as exc:
-        await db.rollback()
-        logger.error(f"Failed to persist chat message in lounge '{lounge_id}': {exc}", exc_info=exc)
-        raise AppException(
-            message="Failed to persist chat message.",
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            code="PERSISTENCE_FAILED",
-        ) from exc
+    if use_batch_persistence:
+        batch_persistence.enqueue_chat_message(chat_msg)
+    else:
+        db.add(chat_msg)
+        try:
+            await db.commit()
+            await db.refresh(chat_msg)
+        except Exception as exc:
+            await db.rollback()
+            logger.error(f"Failed to persist chat message in lounge '{lounge_id}': {exc}", exc_info=exc)
+            raise AppException(
+                message="Failed to persist chat message.",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                code="PERSISTENCE_FAILED",
+            ) from exc
 
     display_name = current_user.display_name or f"User {current_user.id}"
     await broadcast_chat_message(

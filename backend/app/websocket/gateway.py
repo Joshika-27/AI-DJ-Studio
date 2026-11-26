@@ -41,6 +41,7 @@ from app.services.lounge_service import (
     vote_track_in_lounge_queue,
 )
 from app.services.room_state_manager import room_state_manager
+from app.websocket.batch_persistence import batch_persistence
 from app.websocket.connection_manager import connection_manager
 
 logger = get_logger("websocket.gateway")
@@ -198,7 +199,10 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
                 ts=int(join_dt.timestamp() * 1000),
                 created_at=join_dt,
             )
-            db.add(join_event)
+            if batch_persistence.is_running:
+                batch_persistence.enqueue_queue_event(join_event)
+            else:
+                db.add(join_event)
             await db.commit()
             active_joined_at[user_id] = format_iso_utc(join_dt) or ""
             if user_id not in participant_roles:
@@ -469,6 +473,7 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
                             lounge_id=loungeId,
                             current_user=current_user,
                             payload=chat_payload,
+                            use_batch_persistence=batch_persistence.is_running,
                         )
                         connection_manager.clear_user_typing(loungeId, user_id)
                     except AppException as exc:
@@ -721,6 +726,10 @@ async def websocket_lounge_endpoint(websocket: WebSocket, loungeId: str) -> None
                         .where(ChatMessage.lounge_id == loungeId)
                     )
                     target_msg = (await db.execute(msg_stmt)).scalar_one_or_none()
+                    if target_msg is None:
+                        target_msg = batch_persistence.get_pending_chat_message(
+                            loungeId, reaction_payload.messageId
+                        )
                     if target_msg is None:
                         err_msg = make_ws_envelope(
                             event="lounge.error",

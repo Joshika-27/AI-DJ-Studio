@@ -609,7 +609,11 @@ class RoomStateManager:
                     ts=int(now_dt.timestamp() * 1000),
                     created_at=now_dt,
                 )
-                db.add(db_event)
+                from app.websocket.batch_persistence import batch_persistence
+                if batch_persistence.is_running:
+                    batch_persistence.enqueue_queue_event(db_event)
+                else:
+                    db.add(db_event)
                 await db.commit()
             except Exception as exc:
                 await db.rollback()
@@ -750,7 +754,11 @@ class RoomStateManager:
                     ts=int(now_dt.timestamp() * 1000),
                     created_at=now_dt,
                 )
-                db.add(db_event)
+                from app.websocket.batch_persistence import batch_persistence
+                if batch_persistence.is_running:
+                    batch_persistence.enqueue_queue_event(db_event)
+                else:
+                    db.add(db_event)
                 await db.commit()
             except Exception as exc:
                 await db.rollback()
@@ -905,7 +913,11 @@ class RoomStateManager:
                     ts=int(now_dt.timestamp() * 1000),
                     created_at=now_dt,
                 )
-                db.add(db_event)
+                from app.websocket.batch_persistence import batch_persistence
+                if batch_persistence.is_running:
+                    batch_persistence.enqueue_queue_event(db_event)
+                else:
+                    db.add(db_event)
                 await db.commit()
             except Exception as exc:
                 await db.rollback()
@@ -1000,7 +1012,11 @@ class RoomStateManager:
                     ts=int(now_dt.timestamp() * 1000),
                     created_at=now_dt,
                 )
-                db.add(db_event)
+                from app.websocket.batch_persistence import batch_persistence
+                if batch_persistence.is_running:
+                    batch_persistence.enqueue_queue_event(db_event)
+                else:
+                    db.add(db_event)
                 await db.commit()
             except Exception as exc:
                 await db.rollback()
@@ -1134,7 +1150,11 @@ class RoomStateManager:
                     ts=int(now_dt.timestamp() * 1000),
                     created_at=now_dt,
                 )
-                db.add(db_event)
+                from app.websocket.batch_persistence import batch_persistence
+                if batch_persistence.is_running:
+                    batch_persistence.enqueue_queue_event(db_event)
+                else:
+                    db.add(db_event)
                 await db.commit()
             except Exception as exc:
                 await db.rollback()

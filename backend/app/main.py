@@ -2,6 +2,7 @@
 
 import re
 import time
+from contextlib import asynccontextmanager
 from typing import Callable
 
 from fastapi import FastAPI, Request, Response
@@ -12,6 +13,7 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.health import router as health_router
 from app.api.v1.lounges import router as lounges_router
 from app.api.v1.tracks import router as tracks_router
+from app.websocket.batch_persistence import batch_persistence
 from app.websocket.gateway import router as ws_router
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
@@ -42,6 +44,14 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     configure_logging(settings.LOG_LEVEL)
     logger = get_logger("main")
 
+    @asynccontextmanager
+    async def lifespan(app_inst: FastAPI):
+        # Startup: Start background batch persistence worker (Module 8.5, REQ-056)
+        batch_persistence.start()
+        yield
+        # Shutdown: Stop worker and cleanly drain in-memory queues (Module 8.5)
+        await batch_persistence.stop()
+
     app = FastAPI(
         title=settings.APP_NAME,
         version=settings.APP_VERSION,
@@ -50,6 +60,7 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
         ),
         docs_url="/docs",
         redoc_url="/redoc",
+        lifespan=lifespan,
     )
     app.state.settings = settings
 
